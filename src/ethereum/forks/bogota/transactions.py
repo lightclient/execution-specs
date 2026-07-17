@@ -4,7 +4,7 @@ submitted to be executed. If Ethereum is viewed as a state machine,
 transactions are the events that move between states.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Tuple, TypeGuard, final
 
 from ethereum_rlp import rlp
@@ -12,7 +12,11 @@ from ethereum_types.bytes import Bytes, Bytes0, Bytes32
 from ethereum_types.frozen import slotted_freezable
 from ethereum_types.numeric import U64, U256, Uint, ulen
 
-from ethereum.crypto.elliptic_curve import SECP256K1N, secp256k1_recover
+from ethereum.crypto.elliptic_curve import (
+    SECP256K1N,
+    secp256k1_recover,
+    secp256r1_verify,
+)
 from ethereum.crypto.hash import Hash32, keccak256
 from ethereum.exceptions import (
     InsufficientTransactionGasError,
@@ -22,6 +26,7 @@ from ethereum.exceptions import (
 from ethereum.state import Address
 
 from .exceptions import (
+    FrameTransactionFormatError,
     InitCodeTooLargeError,
     TransactionTypeError,
 )
@@ -73,6 +78,179 @@ Floor data tokens contributed by a single access list storage key per
 [EIP-7981].
 
 [EIP-7981]: https://eips.ethereum.org/EIPS/eip-7981
+"""
+
+FRAME_TX_INTRINSIC_COST = Uint(15000)
+"""
+Base intrinsic cost of a frame transaction per [EIP-8141].
+
+[EIP-8141]: https://eips.ethereum.org/EIPS/eip-8141
+"""
+
+FRAME_TX_PER_FRAME_COST = Uint(475)
+"""
+Fixed cost charged for each frame in a frame transaction per [EIP-8141].
+It covers the call-context overhead of the frame boundary and the
+per-frame receipt entry.
+
+[EIP-8141]: https://eips.ethereum.org/EIPS/eip-8141
+"""
+
+ENTRY_POINT = Address(b"\x00" * 19 + b"\xaa")
+"""
+Address used as the caller of `DEFAULT` and `VERIFY` mode frames per
+[EIP-8141].
+
+[EIP-8141]: https://eips.ethereum.org/EIPS/eip-8141
+"""
+
+EXPIRY_VERIFIER = Address(b"\x00" * 18 + b"\x81\x41")
+"""
+Address of the expiry verifier contract per [EIP-8141]. A `VERIFY` frame
+targeting this address checks that the transaction has not expired.
+
+[EIP-8141]: https://eips.ethereum.org/EIPS/eip-8141
+"""
+
+EXPIRY_VERIFIER_CODE = Bytes(
+    bytes.fromhex("60083614600a575f5ffd5b5f3560c01c4211601657005b5f5ffd")
+)
+"""
+Runtime code installed at [`EXPIRY_VERIFIER`] per [EIP-8141]. It reverts
+unless the calldata is an 8-byte big-endian timestamp that is greater
+than or equal to the block timestamp.
+
+[`EXPIRY_VERIFIER`]: ref:ethereum.forks.bogota.transactions.EXPIRY_VERIFIER
+[EIP-8141]: https://eips.ethereum.org/EIPS/eip-8141
+"""
+
+EXPIRY_DATA_LENGTH = 8
+"""
+Required length of the calldata of an expiry verifier frame per
+[EIP-8141].
+
+[EIP-8141]: https://eips.ethereum.org/EIPS/eip-8141
+"""
+
+MAX_FRAMES = 64
+"""
+Maximum number of frames in a frame transaction per [EIP-8141].
+
+[EIP-8141]: https://eips.ethereum.org/EIPS/eip-8141
+"""
+
+FRAME_MODE_DEFAULT = Uint(0)
+"""
+Frame mode executing the frame as a call from [`ENTRY_POINT`].
+
+[`ENTRY_POINT`]: ref:ethereum.forks.bogota.transactions.ENTRY_POINT
+"""
+
+FRAME_MODE_VERIFY = Uint(1)
+"""
+Frame mode identifying the frame as transaction validation. The frame
+executes with static-call semantics; only `APPROVE` may modify state.
+A reverting `VERIFY` frame invalidates the whole transaction.
+"""
+
+FRAME_MODE_SENDER = Uint(2)
+"""
+Frame mode executing the frame as a call from the transaction sender.
+Requires prior execution approval.
+"""
+
+FRAME_MODE_COUNT = Uint(3)
+"""
+Number of defined frame modes. `frame.mode` must be strictly less than
+this value.
+"""
+
+ATOMIC_BATCH_FLAG = Uint(0x4)
+"""
+Bit 2 of `frame.flags`: the frame forms an atomic batch with the frames
+that follow it, up to and including the first frame without this flag.
+"""
+
+FRAME_FLAGS_LIMIT = Uint(8)
+"""
+Exclusive upper bound of the `frame.flags` field. Higher bits are
+reserved.
+"""
+
+APPROVE_NONE = Uint(0x0)
+"""
+Approval scope permitting no approval at all.
+"""
+
+APPROVE_PAYMENT = Uint(0x1)
+"""
+Approval scope where the approving contract pays the total gas cost of
+the transaction.
+"""
+
+APPROVE_EXECUTION = Uint(0x2)
+"""
+Approval scope where the sender contract approves future frames calling
+on its behalf. Only valid when the frame's resolved target equals the
+transaction sender.
+"""
+
+APPROVE_EXECUTION_AND_PAYMENT = Uint(0x3)
+"""
+Approval scope combining [`APPROVE_PAYMENT`] and [`APPROVE_EXECUTION`].
+
+[`APPROVE_PAYMENT`]: ref:ethereum.forks.bogota.transactions.APPROVE_PAYMENT
+[`APPROVE_EXECUTION`]: ref:ethereum.forks.bogota.transactions.APPROVE_EXECUTION
+"""
+
+APPROVE_SCOPE_MASK = APPROVE_EXECUTION_AND_PAYMENT
+"""
+Mask extracting the approval scope from `frame.flags` (bits 0-1).
+"""
+
+SIGNATURE_SCHEME_ARBITRARY = Uint(0x0)
+"""
+Signature scheme carrying arbitrary witness bytes that are not validated
+by the protocol.
+"""
+
+SIGNATURE_SCHEME_SECP256K1 = Uint(0x1)
+"""
+Signature scheme for secp256k1 signatures encoded as
+`v (1 byte) || r (32 bytes) || s (32 bytes)`.
+"""
+
+SIGNATURE_SCHEME_P256 = Uint(0x2)
+"""
+Signature scheme for P-256 signatures encoded as
+`r || s || qx || qy` (each 32 bytes).
+"""
+
+SECP256K1_SIGNATURE_VERIFICATION_GAS = Uint(2800)
+"""
+Gas charged for protocol validation of a secp256k1 signature entry.
+"""
+
+P256_SIGNATURE_VERIFICATION_GAS = Uint(6700)
+"""
+Gas charged for protocol validation of a P-256 signature entry.
+"""
+
+FRAME_STATUS_FAILURE = Uint(0)
+"""
+Frame receipt status of a frame whose execution reverted or was rolled
+back as part of a failed atomic batch.
+"""
+
+FRAME_STATUS_SUCCESS = Uint(1)
+"""
+Frame receipt status of a frame that executed successfully.
+"""
+
+FRAME_STATUS_SKIPPED = Uint(2)
+"""
+Frame receipt status of a frame that was skipped because an earlier
+frame of its atomic batch failed.
 """
 
 
@@ -483,12 +661,165 @@ class SetCodeTransaction:
     """
 
 
+@final
+@slotted_freezable
+@dataclass
+class Frame:
+    """
+    A single execution frame of a [`FrameTransaction`][ft], as defined
+    in [EIP-8141]. A frame is a contract call that validates the
+    transaction, approves gas payment, or executes a user operation.
+
+    [ft]: ref:ethereum.forks.bogota.transactions.FrameTransaction
+    [EIP-8141]: https://eips.ethereum.org/EIPS/eip-8141
+    """
+
+    mode: Uint
+    """
+    The execution semantics of the frame: 0 = `DEFAULT`, 1 = `VERIFY`,
+    2 = `SENDER`.
+    """
+
+    flags: Uint
+    """
+    Optional frame features. Bits 0-1 are the allowed approval scope and
+    bit 2 marks the frame as part of an atomic batch.
+    """
+
+    target: Bytes0 | Address
+    """
+    The destination address of the frame. If empty, the frame targets
+    the transaction sender.
+    """
+
+    gas_limit: Uint
+    """
+    The maximum gas allowed to be used by the frame.
+    """
+
+    value: U256
+    """
+    The amount in wei transferred from the sender as part of the frame
+    execution. Must be zero unless the frame mode is `SENDER`.
+    """
+
+    data: Bytes
+    """
+    The calldata provided to the top level call of the frame.
+    """
+
+
+@final
+@slotted_freezable
+@dataclass
+class TransactionSignature:
+    """
+    A signature entry of a [`FrameTransaction`][ft], as defined in
+    [EIP-8141]. Signature entries are validated by the protocol before
+    any frame executes and may be referenced by `VERIFY` frames and by
+    ordinary EVM execution through the `SIGPARAM` instruction.
+
+    [ft]: ref:ethereum.forks.bogota.transactions.FrameTransaction
+    [EIP-8141]: https://eips.ethereum.org/EIPS/eip-8141
+    """
+
+    scheme: Uint
+    """
+    The verification scheme used to interpret the raw signature bytes:
+    0 = `ARBITRARY`, 1 = `SECP256K1`, 2 = `P256`.
+    """
+
+    signer: Bytes
+    """
+    Scheme-dependent signer metadata. A 20-byte address for `SECP256K1`
+    and `P256`; empty for `ARBITRARY`.
+    """
+
+    msg: Bytes
+    """
+    Either empty, indicating the canonical transaction signature hash,
+    or an explicit 32-byte digest. The explicit 32-byte zero digest is
+    invalid.
+    """
+
+    signature: Bytes
+    """
+    Raw signature bytes interpreted according to `scheme`.
+    """
+
+
+@final
+@slotted_freezable
+@dataclass
+class FrameTransaction:
+    """
+    The transaction type added in [EIP-8141].
+
+    A frame transaction decomposes into a sequence of frames — contract
+    calls that validate the transaction, approve gas payment, and
+    execute user operations — allowing validity and gas payment to be
+    defined abstractly by account code.
+
+    [EIP-8141]: https://eips.ethereum.org/EIPS/eip-8141
+    """
+
+    chain_id: U64
+    """
+    The ID of the chain on which this transaction is executed.
+    """
+
+    nonce: U64
+    """
+    A scalar value equal to the number of transactions sent by the
+    sender.
+    """
+
+    sender: Address
+    """
+    The address of the intended sender of the transaction.
+    """
+
+    frames: Tuple[Frame, ...]
+    """
+    The ordered list of frames to execute.
+    """
+
+    signatures: Tuple[TransactionSignature, ...]
+    """
+    The list of validated signatures available to the transaction.
+    """
+
+    max_priority_fee_per_gas: Uint
+    """
+    The maximum priority fee per gas that the sender is willing to pay.
+    """
+
+    max_fee_per_gas: Uint
+    """
+    The maximum fee per gas that the sender is willing to pay, including
+    the base fee and priority fee.
+    """
+
+    max_fee_per_blob_gas: U256
+    """
+    The maximum fee per blob gas that the sender is willing to pay. Must
+    be zero if `blob_versioned_hashes` is empty.
+    """
+
+    blob_versioned_hashes: Tuple[VersionedHash, ...]
+    """
+    A tuple of objects that represent the versioned hashes of the blobs
+    included in the transaction.
+    """
+
+
 Transaction = (
     LegacyTransaction
     | AccessListTransaction
     | FeeMarketTransaction
     | BlobTransaction
     | SetCodeTransaction
+    | FrameTransaction
 )
 """
 Union type representing any valid transaction type.
@@ -543,6 +874,8 @@ def encode_transaction(tx: Transaction) -> LegacyTransaction | Bytes:
         return b"\x03" + rlp.encode(tx)
     elif isinstance(tx, SetCodeTransaction):
         return b"\x04" + rlp.encode(tx)
+    elif isinstance(tx, FrameTransaction):
+        return b"\x06" + rlp.encode(tx)
     else:
         raise Exception(f"Unable to encode transaction of type {type(tx)}")
 
@@ -568,6 +901,8 @@ def decode_transaction(tx: LegacyTransaction | Bytes) -> Transaction:
             return rlp.decode_to(BlobTransaction, tx[1:])
         elif tx[0] == 4:
             return rlp.decode_to(SetCodeTransaction, tx[1:])
+        elif tx[0] == 6:
+            return rlp.decode_to(FrameTransaction, tx[1:])
         elif tx[0] >= 0xC0:
             assert tx[0] <= 0xFE
             return rlp.decode_to(LegacyTransaction, tx)
@@ -595,6 +930,12 @@ def validate_transaction(tx: Transaction, sender: Address) -> IntrinsicGasCost:
     Also, the code size of a contract creation transaction must be within
     limits of the protocol.
 
+    Frame transactions have no gas limit field: their gas limit is derived
+    from the transaction contents, so the intrinsic cost is covered by
+    construction. Their structure is checked by
+    [`validate_frame_transaction`][vft] and their calldata floor is
+    validated against the derived gas limit.
+
     This function takes a transaction and gas_limit as parameters and
     returns the intrinsic gas costs for the transaction after validation.
     It throws an `InsufficientTransactionGasError` exception if the
@@ -606,25 +947,37 @@ def validate_transaction(tx: Transaction, sender: Address) -> IntrinsicGasCost:
 
     [EIP-2681]: https://eips.ethereum.org/EIPS/eip-2681
     [EIP-7623]: https://eips.ethereum.org/EIPS/eip-7623
+    [vft]: ref:ethereum.forks.bogota.transactions.validate_frame_transaction
     """
     from .vm.interpreter import MAX_INIT_CODE_SIZE
 
     intrinsic = calculate_intrinsic_cost(tx, sender)
-    intrinsic_gas = Uint(intrinsic.regular) + Uint(intrinsic.state)
-    if intrinsic_gas > tx.gas:
-        raise InsufficientTransactionGasError("Insufficient intrinsic gas")
-    if intrinsic.calldata_floor > tx.gas:
-        raise InsufficientTransactionGasError("Insufficient calldata floor")
-    if tx.to == Bytes0(b"") and len(tx.data) > MAX_INIT_CODE_SIZE:
-        raise InitCodeTooLargeError("Code size too large")
-    if intrinsic.regular > TX_MAX_GAS_LIMIT:
-        raise InsufficientTransactionGasError(
-            "Intrinsic regular gas exceeds TX_MAX_GAS_LIMIT"
-        )
-    if intrinsic.calldata_floor > TX_MAX_GAS_LIMIT:
-        raise InsufficientTransactionGasError(
-            "Intrinsic calldata floor exceeds TX_MAX_GAS_LIMIT"
-        )
+    if isinstance(tx, FrameTransaction):
+        validate_frame_transaction(tx)
+        if intrinsic.calldata_floor > calculate_frame_transaction_gas_limit(
+            tx
+        ):
+            raise InsufficientTransactionGasError(
+                "Insufficient calldata floor"
+            )
+    else:
+        intrinsic_gas = Uint(intrinsic.regular) + Uint(intrinsic.state)
+        if intrinsic_gas > tx.gas:
+            raise InsufficientTransactionGasError("Insufficient intrinsic gas")
+        if intrinsic.calldata_floor > tx.gas:
+            raise InsufficientTransactionGasError(
+                "Insufficient calldata floor"
+            )
+        if tx.to == Bytes0(b"") and len(tx.data) > MAX_INIT_CODE_SIZE:
+            raise InitCodeTooLargeError("Code size too large")
+        if intrinsic.regular > TX_MAX_GAS_LIMIT:
+            raise InsufficientTransactionGasError(
+                "Intrinsic regular gas exceeds TX_MAX_GAS_LIMIT"
+            )
+        if intrinsic.calldata_floor > TX_MAX_GAS_LIMIT:
+            raise InsufficientTransactionGasError(
+                "Intrinsic calldata floor exceeds TX_MAX_GAS_LIMIT"
+            )
     if U256(tx.nonce) >= U256(U64.MAX_VALUE):
         raise NonceOverflowError("Nonce too high")
 
@@ -660,6 +1013,10 @@ def calculate_intrinsic_cost(
     Self-transfers (``sender == tx.to``) skip the recipient and value
     charges.
 
+    The intrinsic cost of a frame transaction is instead the base cost, the
+    per-frame cost, the calldata cost of the frame and signature byte
+    fields, and the signature verification cost.
+
     This function takes a transaction and gas_limit as parameters and
     returns the intrinsic regular gas cost, intrinsic state gas cost, and the
     minimum gas cost used by the transaction based on the calldata size.
@@ -669,6 +1026,29 @@ def calculate_intrinsic_cost(
         StateGasCosts,
         init_code_cost,
     )
+
+    if isinstance(tx, FrameTransaction):
+        signature_gas = Uint(0)
+        for sig in tx.signatures:
+            signature_gas += signature_verification_gas(sig)
+
+        calldata_tokens = Uint(0)
+        for charged_data in frame_transaction_charged_data(tx):
+            calldata_tokens += count_tokens_in_data(charged_data)
+
+        regular_gas = (
+            FRAME_TX_INTRINSIC_COST
+            + ulen(tx.frames) * FRAME_TX_PER_FRAME_COST
+            + calldata_tokens * GasCosts.TX_DATA_TOKEN_STANDARD
+            + signature_gas
+        )
+        return IntrinsicGasCost(
+            regular=RegularGas(regular_gas),
+            state=StateGas(Uint(0)),
+            calldata_floor=RegularGas(
+                calculate_frame_transaction_calldata_floor(tx)
+            ),
+        )
 
     tokens_in_calldata = count_tokens_in_data(tx.data)
 
@@ -787,10 +1167,15 @@ def recover_sender(tx: Transaction) -> Address:
     signing hash of the transaction. The sender's public key can be obtained
     with these two values and therefore the sender address can be retrieved.
 
+    Frame transactions declare their sender explicitly and are
+    authenticated by their signature list, so they never reach this
+    function.
+
     This function takes chain_id and a transaction as parameters and returns
     the address of the sender of the transaction. It raises an
     `InvalidSignatureError` if the signature values (r, s, v) are invalid.
     """
+    assert not isinstance(tx, FrameTransaction)
     r, s = tx.r, tx.s
     if U256(0) >= r or r >= SECP256K1N:
         raise InvalidSignatureError("bad r")
@@ -1029,3 +1414,292 @@ def has_access_list(
         tx,
         AccessListCapableTransaction,
     )
+
+
+def resolve_frame_target(tx: FrameTransaction, frame: Frame) -> Address:
+    """
+    Return the resolved target address of a frame.
+
+    An empty frame target resolves to the transaction sender.
+    """
+    if isinstance(frame.target, Bytes0):
+        return tx.sender
+    return frame.target
+
+
+def is_expiry_verifier_frame(frame: Frame) -> bool:
+    """
+    Return whether the frame is an expiry verifier frame, i.e. a
+    `VERIFY` frame targeting the [`EXPIRY_VERIFIER`] contract.
+
+    [`EXPIRY_VERIFIER`]: ref:ethereum.forks.bogota.transactions.EXPIRY_VERIFIER
+    """
+    return frame.mode == FRAME_MODE_VERIFY and frame.target == EXPIRY_VERIFIER
+
+
+def validate_frame_transaction(tx: FrameTransaction) -> None:
+    """
+    Verify the static constraints of a frame transaction.
+
+    The frame count, frame fields, and signature entry structure are
+    checked against the limits defined in [EIP-8141]. A
+    `FrameTransactionFormatError` is raised for any violation.
+
+    [EIP-8141]: https://eips.ethereum.org/EIPS/eip-8141
+    """
+    if len(tx.frames) == 0 or len(tx.frames) > MAX_FRAMES:
+        raise FrameTransactionFormatError(
+            "frame count must be greater than 0 and at most MAX_FRAMES"
+        )
+
+    for sig in tx.signatures:
+        if tx_signature_scheme_is_protocol_validated(sig):
+            if len(sig.signer) not in (0, 20):
+                raise FrameTransactionFormatError(
+                    "signer must be empty or a 20-byte address"
+                )
+        elif sig.scheme == SIGNATURE_SCHEME_ARBITRARY:
+            if len(sig.signer) != 0:
+                raise FrameTransactionFormatError(
+                    "arbitrary signature signer must be empty"
+                )
+        else:
+            raise FrameTransactionFormatError("unknown signature scheme")
+        if len(sig.msg) == 32:
+            if sig.msg == b"\x00" * 32:
+                raise FrameTransactionFormatError(
+                    "explicit zero digest is invalid"
+                )
+        elif len(sig.msg) != 0:
+            raise FrameTransactionFormatError(
+                "signature msg must be empty or 32 bytes"
+            )
+
+    total_frame_gas = Uint(0)
+    expiry_verifier_frames = 0
+    for i, frame in enumerate(tx.frames):
+        if frame.mode >= FRAME_MODE_COUNT:
+            raise FrameTransactionFormatError("unknown frame mode")
+        if frame.flags >= FRAME_FLAGS_LIMIT:
+            raise FrameTransactionFormatError("reserved frame flags set")
+        if frame.gas_limit > Uint(U64.MAX_VALUE):
+            raise FrameTransactionFormatError("frame gas limit too high")
+        if frame.mode != FRAME_MODE_SENDER and frame.value != 0:
+            raise FrameTransactionFormatError(
+                "non-zero value outside SENDER mode"
+            )
+        total_frame_gas += frame.gas_limit
+        if total_frame_gas > Uint(U64.MAX_VALUE):
+            raise FrameTransactionFormatError("total frame gas too high")
+
+        # Execution approval is only allowed for frames that resolve to
+        # the transaction sender.
+        if (
+            frame.flags & APPROVE_EXECUTION
+            and resolve_frame_target(tx, frame) != tx.sender
+        ):
+            raise FrameTransactionFormatError(
+                "execution approval flag outside sender target"
+            )
+
+        # An atomic batch must be terminated by a subsequent frame.
+        if frame.flags & ATOMIC_BATCH_FLAG and i + 1 >= len(tx.frames):
+            raise FrameTransactionFormatError(
+                "atomic batch flag set on last frame"
+            )
+
+        if is_expiry_verifier_frame(frame):
+            expiry_verifier_frames += 1
+            if frame.flags != 0:
+                raise FrameTransactionFormatError(
+                    "expiry verifier frame flags must be zero"
+                )
+            if len(frame.data) != EXPIRY_DATA_LENGTH:
+                raise FrameTransactionFormatError(
+                    "expiry verifier frame data must be 8 bytes"
+                )
+
+    if expiry_verifier_frames > 1:
+        raise FrameTransactionFormatError("multiple expiry verifier frames")
+
+    if len(tx.blob_versioned_hashes) == 0 and tx.max_fee_per_blob_gas != 0:
+        raise FrameTransactionFormatError(
+            "max_fee_per_blob_gas must be zero without blobs"
+        )
+
+
+def tx_signature_scheme_is_protocol_validated(
+    sig: TransactionSignature,
+) -> bool:
+    """
+    Return whether the signature entry uses a scheme that is
+    cryptographically validated by the protocol.
+    """
+    return sig.scheme in (
+        SIGNATURE_SCHEME_SECP256K1,
+        SIGNATURE_SCHEME_P256,
+    )
+
+
+def signature_verification_gas(sig: TransactionSignature) -> Uint:
+    """
+    Return the gas charged for validating a single signature entry.
+    """
+    if sig.scheme == SIGNATURE_SCHEME_SECP256K1:
+        return SECP256K1_SIGNATURE_VERIFICATION_GAS
+    if sig.scheme == SIGNATURE_SCHEME_P256:
+        return P256_SIGNATURE_VERIFICATION_GAS
+    assert sig.scheme == SIGNATURE_SCHEME_ARBITRARY
+    return Uint(0)
+
+
+def frame_transaction_charged_data(tx: FrameTransaction) -> Tuple[Bytes, ...]:
+    """
+    Return the byte fields of a frame transaction that are priced as
+    calldata: the `data` of each frame and the `signer`, `msg`, and
+    `signature` bytes of each signature entry. The fixed-size fields
+    are covered by the intrinsic and per-frame costs.
+    """
+    charged: Tuple[Bytes, ...] = ()
+    for frame in tx.frames:
+        charged += (frame.data,)
+    for sig in tx.signatures:
+        charged += (sig.signer, sig.msg, sig.signature)
+    return charged
+
+
+def calculate_frame_transaction_gas_limit(tx: FrameTransaction) -> Uint:
+    """
+    Calculate the total gas limit of a frame transaction.
+
+    The gas limit is the sum of the transaction's intrinsic cost — see
+    [`calculate_intrinsic_cost`][cic] — and the gas limits of all frames.
+
+    [cic]: ref:ethereum.forks.bogota.transactions.calculate_intrinsic_cost
+    """
+    intrinsic = calculate_intrinsic_cost(tx, tx.sender)
+
+    total_frame_gas = Uint(0)
+    for frame in tx.frames:
+        total_frame_gas += frame.gas_limit
+
+    return Uint(intrinsic.regular) + total_frame_gas
+
+
+def calculate_frame_transaction_calldata_floor(tx: FrameTransaction) -> Uint:
+    """
+    Calculate the minimum gas cost of a frame transaction based on the
+    size of the frame and signature byte fields, per [EIP-7623] and
+    [EIP-7976]. Like ordinary calldata, every charged byte counts as a
+    standard token and is priced at the floor token cost.
+
+    [EIP-7623]: https://eips.ethereum.org/EIPS/eip-7623
+    [EIP-7976]: https://eips.ethereum.org/EIPS/eip-7976
+    """
+    from .vm.gas import GasCosts
+
+    data_length = Uint(0)
+    for data in frame_transaction_charged_data(tx):
+        data_length += ulen(data)
+    floor_tokens = data_length * GasCosts.TX_DATA_TOKEN_STANDARD
+
+    return (
+        floor_tokens * GasCosts.TX_DATA_TOKEN_FLOOR + FRAME_TX_INTRINSIC_COST
+    )
+
+
+def compute_frame_signature_hash(tx: FrameTransaction) -> Hash32:
+    """
+    Compute the canonical signature hash of a frame transaction.
+
+    The raw `signature` bytes of every entry with an empty `msg` are
+    elided before hashing, since a signature over the canonical hash
+    cannot commit to its own bytes.
+    """
+    elided_signatures = []
+    for sig in tx.signatures:
+        if len(sig.msg) == 0:
+            elided_signatures.append(replace(sig, signature=Bytes(b"")))
+        else:
+            elided_signatures.append(sig)
+
+    elided_tx = replace(tx, signatures=tuple(elided_signatures))
+    return keccak256(b"\x06" + rlp.encode(elided_tx))
+
+
+def resolved_signature_signer(
+    sig: TransactionSignature, sender: Address
+) -> Address:
+    """
+    Resolve the signer address of a protocol-validated signature entry.
+
+    An empty `signer` resolves to the transaction sender.
+    """
+    if len(sig.signer) == 0:
+        return sender
+    return Address(sig.signer)
+
+
+def validate_frame_signature(
+    sig: TransactionSignature, sender: Address, sig_hash: Hash32
+) -> bool:
+    """
+    Validate a single signature entry of a frame transaction.
+
+    An empty `msg` authorizes the canonical signature hash; a 32-byte
+    `msg` authorizes that explicit digest. `SECP256K1` and `P256`
+    entries are cryptographically verified against their resolved
+    signer address — see [`resolved_signature_signer`][rss] — while
+    `ARBITRARY` entries are only structurally checked.
+
+    [rss]: ref:ethereum.forks.bogota.transactions.resolved_signature_signer
+    """
+    if len(sig.msg) == 0:
+        msg = sig_hash
+    elif len(sig.msg) == 32:
+        if sig.msg == b"\x00" * 32:
+            return False
+        msg = Hash32(sig.msg)
+    else:
+        return False
+
+    if sig.scheme == SIGNATURE_SCHEME_SECP256K1:
+        signer = resolved_signature_signer(sig, sender)
+        if len(sig.signature) != 65:
+            return False
+        v = U256(sig.signature[0])
+        r = U256.from_be_bytes(sig.signature[1:33])
+        s = U256.from_be_bytes(sig.signature[33:65])
+        if v not in (U256(0), U256(1)):
+            return False
+        if U256(0) >= r or r >= SECP256K1N:
+            return False
+        if U256(0) >= s or s > SECP256K1N // U256(2):
+            return False
+        try:
+            public_key = secp256k1_recover(r, s, v, msg)
+        except InvalidSignatureError:
+            return False
+        return Bytes(signer) == keccak256(public_key)[12:32]
+
+    elif sig.scheme == SIGNATURE_SCHEME_P256:
+        signer = resolved_signature_signer(sig, sender)
+        if len(sig.signature) != 128:
+            return False
+        r = U256.from_be_bytes(sig.signature[0:32])
+        s = U256.from_be_bytes(sig.signature[32:64])
+        qx = U256.from_be_bytes(sig.signature[64:96])
+        qy = U256.from_be_bytes(sig.signature[96:128])
+        if Bytes(signer) != keccak256(sig.signature[64:128])[12:32]:
+            return False
+        try:
+            secp256r1_verify(r, s, qx, qy, msg)
+        except (InvalidSignatureError, ValueError):
+            return False
+        return True
+
+    elif sig.scheme == SIGNATURE_SCHEME_ARBITRARY:
+        return len(sig.signer) == 0
+
+    else:
+        return False

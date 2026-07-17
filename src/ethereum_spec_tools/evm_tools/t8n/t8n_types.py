@@ -163,6 +163,15 @@ class Txs:
         """
         t8n = self.t8n
 
+        if "frames" in raw_tx:
+            # EIP-8141 frame transactions carry an explicit sender and a
+            # signature list instead of gas/input/to/value/v/r/s.
+            tx = TransactionLoad(raw_tx, t8n.fork).read()
+            self.all_txs.append(tx)
+            if t8n.fork.has_decode_transaction:
+                return t8n.fork.decode_transaction(tx)
+            return tx
+
         # for idx, json_tx in enumerate(self.data):
         raw_tx["gasLimit"] = raw_tx["gas"]
         raw_tx["data"] = raw_tx["input"]
@@ -328,6 +337,7 @@ class Result:
         # Apply diffs to pre-state for alloc output
         apply_changes_to_state(t8n.alloc.state, block_diff)
         self.receipts = self.get_receipts_from_output(t8n, block_output)
+        self._logs_bloom = t8n.fork.logs_bloom
 
         if hasattr(block_env, "base_fee_per_gas"):
             self.base_fee = block_env.base_fee_per_gas
@@ -355,6 +365,49 @@ class Result:
         receipts_json = []
         for tx_hash, receipt in self.receipts:
             receipt_dict = {"transactionHash": "0x" + tx_hash.hex()}
+
+            if hasattr(receipt, "frame_receipts"):
+                # EIP-8141 frame transaction receipt.
+                receipt_dict["cumulativeGasUsed"] = hex(
+                    receipt.cumulative_gas_used
+                )
+                receipt_dict["payer"] = "0x" + receipt.payer.hex()
+
+                all_logs = []
+                frame_receipts_json = []
+                for frame_receipt in receipt.frame_receipts:
+                    frame_logs_json = []
+                    for log in frame_receipt.logs:
+                        log_dict = {
+                            "address": "0x" + log.address.hex(),
+                            "topics": [
+                                "0x" + topic.hex() for topic in log.topics
+                            ],
+                            "data": "0x" + log.data.hex(),
+                        }
+                        frame_logs_json.append(log_dict)
+                        all_logs.append(log_dict)
+                    frame_receipts_json.append(
+                        {
+                            "status": hex(int(frame_receipt.status)),
+                            "gasUsed": hex(int(frame_receipt.gas_used)),
+                            "logs": frame_logs_json,
+                        }
+                    )
+                receipt_dict["frameReceipts"] = frame_receipts_json
+                receipt_dict["logs"] = all_logs
+
+                # Derive success and bloom for tooling compatibility.
+                # Frame transactions that make it into a block are valid,
+                # regardless of individual frame results.
+                receipt_dict["succeeded"] = True
+                frame_logs = []
+                for frame_receipt in receipt.frame_receipts:
+                    frame_logs.extend(frame_receipt.logs)
+                bloom = self._logs_bloom(tuple(frame_logs))
+                receipt_dict["bloom"] = "0x" + bloom.hex()
+                receipts_json.append(receipt_dict)
+                continue
 
             if hasattr(receipt, "succeeded"):
                 receipt_dict["succeeded"] = receipt.succeeded

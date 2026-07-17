@@ -11,6 +11,10 @@ from ethereum_spec_tools.evm_tools.t8n.transition_tool import EELST8N
 
 from ethereum.ethash import *
 from ethereum.fork_criteria import Unscheduled
+from ethereum.forks.bogota.transactions import (
+    EXPIRY_VERIFIER_CODE,
+    FRAME_MODE_DEFAULT,
+)
 from ethereum.trace import EvmTracer
 from ethereum.utils.hexadecimal import hex_to_bytes256
 from ethereum_optimized.state_db import State
@@ -46,6 +50,10 @@ Withdrawal.validator_index
 
 # src/ethereum/fork_criteria.py
 Unscheduled
+
+# src/ethereum/forks/bogota/transactions.py
+EXPIRY_VERIFIER_CODE
+FRAME_MODE_DEFAULT
 
 # src/ethereum/ethash.py
 ethash.generate_dataset
@@ -106,6 +114,9 @@ TransactionLoad.json_to_chain_id
 TransactionLoad.json_to_nonce
 TransactionLoad.json_to_gas
 TransactionLoad.json_to_to
+TransactionLoad.json_to_sender
+TransactionLoad.json_to_frames
+TransactionLoad.json_to_signatures
 TransactionLoad.json_to_value
 TransactionLoad.json_to_data
 TransactionLoad.json_to_access_list
@@ -114,6 +125,9 @@ TransactionLoad.json_to_max_fee_per_gas
 TransactionLoad.json_to_max_priority_fee_per_gas
 TransactionLoad.json_to_max_fee_per_blob_gas
 TransactionLoad.json_to_blob_versioned_hashes
+TransactionLoad.json_to_sender
+TransactionLoad.json_to_frames
+TransactionLoad.json_to_signatures
 TransactionLoad.json_to_v
 TransactionLoad.json_to_y_parity
 TransactionLoad.json_to_r
